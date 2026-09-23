@@ -9,8 +9,14 @@
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- SheetJS voor echte .xlsx-export -->
-  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <!-- pdf.js voor PDF-verwerking in de browser -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.7.76/pdf.min.js"></script>
+  <script>
+    if (window.pdfjsLib) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.7.76/pdf.worker.min.js";
+    }
+  </script>
 
   <style>
     body {
@@ -96,7 +102,7 @@
 
       <p class="mx-auto mt-3 max-w-3xl text-sm leading-6 text-slate-500 sm:text-base">
         Analyseer technische kozijntekeningen met AI, corrigeer de resultaten
-        handmatig en exporteer alles naar een echt Excelbestand.
+        handmatig en exporteer alles naar een Excel-compatibel bestand.
       </p>
     </header>
 
@@ -164,7 +170,7 @@
       <input
         id="fileInput"
         type="file"
-        accept="image/png,image/jpeg,image/jpg"
+        accept=".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application/pdf"
         class="hidden"
       >
 
@@ -178,12 +184,13 @@
         </h2>
 
         <p class="mt-2 text-sm text-slate-500">
-          of klik om een PNG- of JPG-bestand te selecteren
+          of klik om een PNG-, JPG- of PDF-bestand te selecteren
         </p>
 
         <div class="mt-5 flex flex-wrap justify-center gap-2 text-xs text-slate-400">
           <span class="rounded-full bg-slate-100 px-3 py-1">PNG</span>
           <span class="rounded-full bg-slate-100 px-3 py-1">JPG</span>
+          <span class="rounded-full bg-slate-100 px-3 py-1">PDF: alle pagina's</span>
           <span class="rounded-full bg-slate-100 px-3 py-1">Vision AI</span>
         </div>
       </div>
@@ -201,7 +208,7 @@
       class="mb-6 hidden items-center justify-center gap-3 rounded-2xl border border-blue-200 bg-blue-50 p-5 text-sm font-semibold text-blue-800"
     >
       <div class="spinner h-6 w-6 rounded-full border-4 border-blue-600 border-t-transparent"></div>
-      <span>De kozijntekening wordt geanalyseerd...</span>
+      <span id="loadingText">De kozijntekening wordt geanalyseerd...</span>
     </section>
 
     <!-- Error -->
@@ -215,7 +222,6 @@
       id="resultSection"
       class="hidden overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-xl"
     >
-      <!-- Results header -->
       <div class="border-b border-slate-200 bg-slate-50 p-5 sm:p-6">
         <div class="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div>
@@ -264,7 +270,6 @@
         </div>
       </div>
 
-      <!-- Table -->
       <div class="p-4 sm:p-6">
         <div class="mb-4 flex flex-wrap items-center gap-3 text-xs text-slate-500">
           <span class="flex items-center gap-2">
@@ -310,7 +315,6 @@
           </table>
         </div>
 
-        <!-- Raw response -->
         <details class="mt-6">
           <summary class="cursor-pointer text-sm font-semibold text-slate-500 hover:text-slate-800">
             Ruwe AI-respons bekijken
@@ -323,19 +327,12 @@
         </details>
       </div>
     </section>
-
   </main>
 
-  <script>
-    /*
-      AI KOZIJN TOOL
-      - Vision-analyse via OpenAI
-      - Bewerkbare tabel
-      - Live oppervlakteberekening
-      - Lokale opslag van API-sleutel en tabelcorrecties
-      - Echt .xlsx-bestand via SheetJS
-    */
+  <!-- Onzichtbaar canvas voor het renderen van PDF-pagina's -->
+  <canvas id="pdfRenderCanvas" class="hidden"></canvas>
 
+  <script>
     const STORAGE_KEY_API = "kozijn_tool_openai_api_key";
     const STORAGE_KEY_TABLE = "kozijn_tool_table_data";
 
@@ -370,6 +367,7 @@
     const preview = document.getElementById("preview");
 
     const loading = document.getElementById("loading");
+    const loadingText = document.getElementById("loadingText");
     const errorBox = document.getElementById("errorBox");
 
     const resultSection = document.getElementById("resultSection");
@@ -380,16 +378,21 @@
     const resetTableButton = document.getElementById("resetTableBtn");
     const exportButton = document.getElementById("exportBtn");
 
+    const pdfRenderCanvas = document.getElementById("pdfRenderCanvas");
+
     let originalAIItems = [];
 
     const PROMPT_TEXT = `
 Je bent een expert in het analyseren van technische kozijntekeningen,
 bouwtekeningen, gevelaanzichten, raamstaten en deurstaten.
 
-Analyseer de bijgevoegde afbeelding uiterst zorgvuldig.
+De bijgevoegde afbeeldingen zijn opeenvolgende pagina's van één document.
+Analyseer ALLE afbeeldingen uiterst zorgvuldig.
 
 Geef ALLE kozijnen, ramen, deuren, panelen en vaste glasvlakken terug
-die op de tekening herkenbaar zijn.
+die op ALLE pagina's herkenbaar zijn. Voeg de resultaten van iedere pagina
+samen in één enkele lijst. Neem een kozijn slechts één keer op wanneer
+het duidelijk hetzelfde kozijn op meerdere pagina's betreft.
 
 Gebruik exact deze JSON-structuur:
 
@@ -572,13 +575,34 @@ Gebruik geen toelichting buiten de JSON.
       if (file) {
         handleFile(file);
       }
+
+      // Hiermee kun je direct hetzelfde bestand opnieuw kiezen.
+      fileInput.value = "";
     });
 
-    function handleFile(file) {
-      if (!["image/png", "image/jpeg", "image/jpg"].includes(file.type)) {
-        showError("Selecteer een PNG- of JPG-afbeelding.");
-        return;
-      }
+    function isPdfFile(file) {
+      const fileName = String(file.name || "").toLowerCase();
+
+      return (
+        file.type === "application/pdf" ||
+        fileName.endsWith(".pdf")
+      );
+    }
+
+    function isImageFile(file) {
+      const fileName = String(file.name || "").toLowerCase();
+
+      return (
+        file.type === "image/png" ||
+        file.type === "image/jpeg" ||
+        fileName.endsWith(".png") ||
+        fileName.endsWith(".jpg") ||
+        fileName.endsWith(".jpeg")
+      );
+    }
+
+    async function handleFile(file) {
+      hideError();
 
       const apiKey =
         apiKeyInput.value.trim() ||
@@ -591,16 +615,30 @@ Gebruik geen toelichting buiten de JSON.
         return;
       }
 
+      if (isPdfFile(file)) {
+        await handlePdfFile(file);
+        return;
+      }
+
+      if (isImageFile(file)) {
+        handleImageFile(file);
+        return;
+      }
+
+      showError("Selecteer een PNG-, JPG-, JPEG- of PDF-bestand.");
+    }
+
+    function handleImageFile(file) {
       const reader = new FileReader();
 
-      reader.onload = event => {
+      reader.onload = async event => {
         const dataUrl = event.target.result;
 
         preview.src = dataUrl;
         preview.classList.remove("hidden");
         dropContent.classList.add("hidden");
 
-        analyzeImage(dataUrl);
+        await analyzeImages([dataUrl]);
       };
 
       reader.onerror = () => {
@@ -611,12 +649,122 @@ Gebruik geen toelichting buiten de JSON.
     }
 
     // -----------------------------
+    // PDF: alle pagina's renderen
+    // -----------------------------
+
+    async function handlePdfFile(file) {
+      if (typeof pdfjsLib === "undefined") {
+        showError(
+          "De PDF-module (pdf.js) is niet geladen. Controleer je internetverbinding en laad de pagina opnieuw."
+        );
+        return;
+      }
+
+      try {
+        showLoading(true, "PDF wordt geopend...");
+
+        const pageImages = await renderAllPdfPagesToDataUrls(file);
+
+        if (!pageImages.length) {
+          throw new Error("De PDF bevat geen pagina's die verwerkt kunnen worden.");
+        }
+
+        preview.src = pageImages[0];
+        preview.classList.remove("hidden");
+        dropContent.classList.add("hidden");
+
+        await analyzeImages(pageImages);
+      } catch (error) {
+        console.error(error);
+        showError(
+          error.message ||
+          "De PDF kon niet worden verwerkt. Controleer of het bestand geldig is."
+        );
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function renderAllPdfPagesToDataUrls(file) {
+      const arrayBuffer = await file.arrayBuffer();
+
+      const loadingTask = pdfjsLib.getDocument({
+        data: arrayBuffer
+      });
+
+      const pdfDocument = await loadingTask.promise;
+      const totalPages = pdfDocument.numPages;
+      const pageImages = [];
+
+      for (let pageNumber = 1; pageNumber <= totalPages; pageNumber++) {
+        showLoading(
+          true,
+          `Pagina ${pageNumber} van ${totalPages} aan het verwerken...`
+        );
+
+        const page = await pdfDocument.getPage(pageNumber);
+
+        // Schaal 2 geeft voldoende detail voor maatlijnen en tekst.
+        const viewport = page.getViewport({
+          scale: 2
+        });
+
+        pdfRenderCanvas.width = Math.ceil(viewport.width);
+        pdfRenderCanvas.height = Math.ceil(viewport.height);
+
+        const context = pdfRenderCanvas.getContext("2d", {
+          alpha: false
+        });
+
+        // Witte achtergrond voorkomt transparante PNG's.
+        context.fillStyle = "#ffffff";
+        context.fillRect(
+          0,
+          0,
+          pdfRenderCanvas.width,
+          pdfRenderCanvas.height
+        );
+
+        await page.render({
+          canvasContext: context,
+          viewport
+        }).promise;
+
+        const imageDataUrl = pdfRenderCanvas.toDataURL(
+          "image/png"
+        );
+
+        pageImages.push(imageDataUrl);
+
+        context.clearRect(
+          0,
+          0,
+          pdfRenderCanvas.width,
+          pdfRenderCanvas.height
+        );
+      }
+
+      pdfRenderCanvas.width = 0;
+      pdfRenderCanvas.height = 0;
+
+      await pdfDocument.destroy();
+
+      return pageImages;
+    }
+
+    // -----------------------------
     // OpenAI Vision
     // -----------------------------
 
-    async function analyzeImage(dataUrl) {
+    async function analyzeImages(imageDataUrls) {
       hideError();
-      showLoading(true);
+      showLoading(
+        true,
+        imageDataUrls.length > 1
+          ? `Alle ${imageDataUrls.length} PDF-pagina's worden samen geanalyseerd...`
+          : "De kozijntekening wordt geanalyseerd..."
+      );
+
       resultSection.classList.add("hidden");
 
       const apiKey =
@@ -630,13 +778,17 @@ Gebruik geen toelichting buiten de JSON.
       }
 
       try {
-        const responseText = await callOpenAI(apiKey, dataUrl);
+        const responseText = await callOpenAI(
+          apiKey,
+          imageDataUrls
+        );
 
         rawResponse.textContent = responseText;
 
         const items = parseAIResponse(responseText);
 
         originalAIItems = structuredCloneSafe(items);
+
         localStorage.setItem(
           STORAGE_KEY_TABLE,
           JSON.stringify(items)
@@ -652,7 +804,21 @@ Gebruik geen toelichting buiten de JSON.
       }
     }
 
-    async function callOpenAI(apiKey, dataUrl) {
+    async function callOpenAI(apiKey, imageDataUrls) {
+      const content = [
+        {
+          type: "text",
+          text: PROMPT_TEXT
+        },
+        ...imageDataUrls.map((dataUrl, index) => ({
+          type: "image_url",
+          image_url: {
+            url: dataUrl,
+            detail: "high"
+          }
+        }))
+      ];
+
       const response = await fetch(
         "https://api.openai.com/v1/chat/completions",
         {
@@ -668,18 +834,7 @@ Gebruik geen toelichting buiten de JSON.
             messages: [
               {
                 role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: PROMPT_TEXT
-                  },
-                  {
-                    type: "image_url",
-                    image_url: {
-                      url: dataUrl
-                    }
-                  }
-                ]
+                content
               }
             ]
           })
@@ -695,13 +850,13 @@ Gebruik geen toelichting buiten de JSON.
         );
       }
 
-      const content = data?.choices?.[0]?.message?.content;
+      const contentText = data?.choices?.[0]?.message?.content;
 
-      if (!content) {
+      if (!contentText) {
         throw new Error("OpenAI gaf geen bruikbaar antwoord terug.");
       }
 
-      return content;
+      return contentText;
     }
 
     function parseAIResponse(text) {
@@ -769,43 +924,22 @@ Gebruik geen toelichting buiten de JSON.
 
       row.className = "transition hover:bg-slate-50";
 
-      // Kozijnmerk
       row.appendChild(
-        createEditableCell(
-          normalized.merk,
-          "merk",
-          row
-        )
+        createEditableCell(normalized.merk, "merk", row)
       );
 
-      // Kozijnsoort
       row.appendChild(
-        createEditableCell(
-          normalized.soort,
-          "soort",
-          row
-        )
+        createEditableCell(normalized.soort, "soort", row)
       );
 
-      // Hoogte
       row.appendChild(
-        createEditableCell(
-          normalized.hoogte_mm,
-          "hoogte_mm",
-          row
-        )
+        createEditableCell(normalized.hoogte_mm, "hoogte_mm", row)
       );
 
-      // Breedte
       row.appendChild(
-        createEditableCell(
-          normalized.breedte_mm,
-          "breedte_mm",
-          row
-        )
+        createEditableCell(normalized.breedte_mm, "breedte_mm", row)
       );
 
-      // Oppervlakte - readonly
       const oppervlakteCell = document.createElement("td");
 
       oppervlakteCell.dataset.col = "oppervlakte";
@@ -817,25 +951,14 @@ Gebruik geen toelichting buiten de JSON.
 
       row.appendChild(oppervlakteCell);
 
-      // Glassoort
       row.appendChild(
-        createEditableCell(
-          normalized.glassoort,
-          "glassoort",
-          row
-        )
+        createEditableCell(normalized.glassoort, "glassoort", row)
       );
 
-      // G-waarde
       row.appendChild(
-        createEditableCell(
-          normalized.g_waarde,
-          "g_waarde",
-          row
-        )
+        createEditableCell(normalized.g_waarde, "g_waarde", row)
       );
 
-      // Actie
       const actionCell = document.createElement("td");
       actionCell.className = "px-4 py-4 align-top text-center";
 
@@ -866,8 +989,7 @@ Gebruik geen toelichting buiten de JSON.
       cell.dataset.col = column;
       cell.contentEditable = "true";
       cell.spellcheck = false;
-      cell.className =
-        "px-4 py-4 align-top leading-5";
+      cell.className = "px-4 py-4 align-top leading-5";
 
       cell.textContent = formatDisplayValue(value);
 
@@ -933,7 +1055,6 @@ Gebruik geen toelichting buiten de JSON.
 
       const area = (height * width) / 1000000;
 
-      // Exact twee decimalen met punt op het scherm.
       areaCell.textContent = area.toFixed(2);
     }
 
@@ -1004,9 +1125,7 @@ Gebruik geen toelichting buiten de JSON.
 
         return {
           merk: getCellText(row, "merk"),
-          soort: normalizeSoort(
-            getCellText(row, "soort")
-          ),
+          soort: normalizeSoort(getCellText(row, "soort")),
           hoogte_mm: Number.isFinite(height) ? height : null,
           breedte_mm: Number.isFinite(width) ? width : null,
           glassoort: getCellText(row, "glassoort"),
@@ -1024,18 +1143,12 @@ Gebruik geen toelichting buiten de JSON.
     }
 
     // -----------------------------
-    // Echt Excelbestand (.xlsx)
+    // Excel-compatibele CSV-export
+    // Puntkomma als scheidingsteken
     // -----------------------------
 
     exportButton.addEventListener("click", () => {
       hideError();
-
-      if (typeof XLSX === "undefined") {
-        showError(
-          "De Excel-module is niet geladen. Controleer je internetverbinding en laad de pagina opnieuw."
-        );
-        return;
-      }
 
       const items = readTableData();
 
@@ -1044,80 +1157,39 @@ Gebruik geen toelichting buiten de JSON.
         return;
       }
 
-      const excelRows = [
-        EXPORT_HEADERS
+      const rows = [
+        EXPORT_HEADERS,
+        ...items.map(item => {
+          const height = parseMeasurement(item.hoogte_mm);
+          const width = parseMeasurement(item.breedte_mm);
+
+          const area =
+            Number.isFinite(height) && Number.isFinite(width)
+              ? ((height * width) / 1000000).toFixed(2)
+              : "";
+
+          return [
+            item.merk,
+            item.soort,
+            Number.isFinite(height) ? height : "",
+            Number.isFinite(width) ? width : "",
+            area,
+            item.glassoort,
+            item.g_waarde
+          ];
+        })
       ];
 
-      items.forEach(item => {
-        const height = parseMeasurement(item.hoogte_mm);
-        const width = parseMeasurement(item.breedte_mm);
+      const csvContent = rows
+        .map(row => row.map(escapeCsvValue).join(";"))
+        .join("\r\n");
 
-        const area =
-          Number.isFinite(height) && Number.isFinite(width)
-            ? Number(((height * width) / 1000000).toFixed(2))
-            : null;
-
-        excelRows.push([
-          item.merk,
-          item.soort,
-          Number.isFinite(height) ? height : "",
-          Number.isFinite(width) ? width : "",
-          area,
-          item.glassoort,
-          item.g_waarde
-        ]);
-      });
-
-      // Array-of-arrays omzetten naar een werkblad.
-      const worksheet = XLSX.utils.aoa_to_sheet(excelRows);
-
-      // Kolombreedtes instellen.
-      worksheet["!cols"] = [
-        { wch: 16 },
-        { wch: 18 },
-        { wch: 15 },
-        { wch: 15 },
-        { wch: 18 },
-        { wch: 38 },
-        { wch: 20 }
-      ];
-
-      // Autofilter op de volledige tabel.
-      worksheet["!autofilter"] = {
-        ref: `A1:G${excelRows.length}`
-      };
-
-      // Getalnotatie:
-      // C = hoogte
-      // D = breedte
-      // E = oppervlakte
-      for (let rowNumber = 2; rowNumber <= excelRows.length; rowNumber++) {
-        const heightCell = worksheet[`C${rowNumber}`];
-        const widthCell = worksheet[`D${rowNumber}`];
-        const areaCell = worksheet[`E${rowNumber}`];
-
-        if (heightCell && typeof heightCell.v === "number") {
-          heightCell.t = "n";
-          heightCell.z = "0";
+      // UTF-8 BOM zorgt ervoor dat Excel Nederlandse tekens goed opent.
+      const csvBlob = new Blob(
+        ["\uFEFF" + csvContent],
+        {
+          type: "text/csv;charset=utf-8"
         }
-
-        if (widthCell && typeof widthCell.v === "number") {
-          widthCell.t = "n";
-          widthCell.z = "0";
-        }
-
-        if (areaCell && typeof areaCell.v === "number") {
-          areaCell.t = "n";
-          areaCell.z = "0.00";
-        }
-      }
-
-      const workbook = XLSX.utils.book_new();
-
-      XLSX.utils.book_append_sheet(
-        workbook,
-        worksheet,
-        "Kozijnanalyse"
       );
 
       const timestamp = new Date()
@@ -1125,23 +1197,40 @@ Gebruik geen toelichting buiten de JSON.
         .slice(0, 19)
         .replace(/[:T]/g, "-");
 
-      const filename = `kozijn-analyse-${timestamp}.xlsx`;
-
-      // Echte Excel-download.
-      XLSX.writeFile(workbook, filename, {
-        bookType: "xlsx",
-        compression: true
-      });
+      downloadBlob(
+        csvBlob,
+        `kozijn-analyse-${timestamp}.csv`
+      );
 
       const originalText = exportButton.innerHTML;
 
-      exportButton.innerHTML =
-        "✅ Excelbestand gedownload";
+      exportButton.innerHTML = "✅ Excelbestand gedownload";
 
       setTimeout(() => {
         exportButton.innerHTML = originalText;
       }, 2500);
     });
+
+    function escapeCsvValue(value) {
+      const text = String(value ?? "");
+
+      // Dubbele quotes zijn de standaard CSV-escaping.
+      return `"${text.replace(/"/g, '""')}"`;
+    }
+
+    function downloadBlob(blob, filename) {
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      link.href = objectUrl;
+      link.download = filename;
+
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+
+      URL.revokeObjectURL(objectUrl);
+    }
 
     // -----------------------------
     // Hulpfuncties
@@ -1229,11 +1318,6 @@ Gebruik geen toelichting buiten de JSON.
         return NaN;
       }
 
-      // Ondersteunt bijvoorbeeld:
-      // 1200
-      // 1200.5
-      // 1200,5
-      // 1.200,5
       if (
         normalized.includes(".") &&
         normalized.includes(",")
@@ -1254,8 +1338,12 @@ Gebruik geen toelichting buiten de JSON.
       return JSON.parse(JSON.stringify(value));
     }
 
-    function showLoading(show) {
+    function showLoading(show, message) {
       if (show) {
+        if (message) {
+          loadingText.textContent = message;
+        }
+
         loading.classList.remove("hidden");
         loading.classList.add("flex");
       } else {
